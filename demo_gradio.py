@@ -56,7 +56,7 @@ else:
 # -------------------------------------------------------------------------
 # 1) Core model inference
 # -------------------------------------------------------------------------
-def run_model(target_dir, model) -> dict:
+def run_model(target_dir, model, extract_attention=False) -> dict:
     """
     Run the VGGT model on images in the 'target_dir/images' folder and return predictions.
     """
@@ -99,7 +99,7 @@ def run_model(target_dir, model) -> dict:
 
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
-            output = model.inference(frames)
+            output = model.inference(frames, extract_attention=extract_attention)
 
     all_pts3d = []
     all_conf = []
@@ -139,6 +139,48 @@ def run_model(target_dir, model) -> dict:
     for key in predictions.keys():
         if isinstance(predictions[key], torch.Tensor):
             predictions[key] = predictions[key].cpu().numpy()#.squeeze(0)  # remove batch dimension
+
+    # Process attention maps if extracted
+    if extract_attention and hasattr(output, 'attention_maps') and output.attention_maps:
+        try:
+            sys.path.append("src/")
+            from attention_viz import process_attention_maps, visualize_attention_maps, create_attention_heatmap
+            
+            # Process attention maps
+            processed_attention = process_attention_maps(
+                output.attention_maps, 
+                output.patch_start_idx,
+                img_size=(images.shape[-2], images.shape[-1])
+            )
+            predictions["attention_maps"] = processed_attention
+            
+            # Create attention visualizations
+            attention_dir = os.path.join(target_dir, "attention_viz")
+            
+            # Convert images for visualization (from tensor to numpy)
+            viz_images = []
+            for i in range(images.shape[0]):
+                img = images[i].cpu().numpy().transpose(1, 2, 0)  # CHW -> HWC
+                img = (img * 255).astype(np.uint8)  # Assume normalized to [0,1]
+                viz_images.append(img)
+            
+            # Create visualizations
+            if processed_attention:
+                attention_viz_paths = visualize_attention_maps(
+                    viz_images, processed_attention, attention_dir, "global_attention"
+                )
+                predictions["attention_viz_paths"] = attention_viz_paths
+                
+                # Create heatmap
+                heatmap_path = create_attention_heatmap(
+                    processed_attention, 
+                    os.path.join(attention_dir, "attention_heatmap.png"),
+                    "Global Attention Heatmaps"
+                )
+                predictions["attention_heatmap_path"] = heatmap_path
+        except Exception as e:
+            print(f"Warning: Failed to process attention maps: {e}")
+            predictions["attention_maps"] = None
 
     # Generate world points from depth map
     print("Computing world points from depth map...")
@@ -247,6 +289,7 @@ def gradio_demo(
     show_cam=True,
     mask_sky=False,
     prediction_mode="Pointmap Regression",
+    extract_attention=False,
 ):
     """
     Perform reconstruction using the already-created target_dir/images.
@@ -266,7 +309,7 @@ def gradio_demo(
 
     print("Running run_model...")
     with torch.no_grad():
-        predictions = run_model(target_dir, model)
+        predictions = run_model(target_dir, model, extract_attention=extract_attention)
 
     # Save predictions
     prediction_save_path = os.path.join(target_dir, "predictions.npz")
@@ -304,8 +347,16 @@ def gradio_demo(
     end_time = time.time()
     print(f"Total time: {end_time - start_time:.2f} seconds (including IO)")
     log_msg = f"Reconstruction Success ({len(all_files)} frames). Waiting for visualization."
+    
+    # Return attention visualization paths if available
+    attention_gallery = None
+    attention_heatmap = None
+    if extract_attention and "attention_viz_paths" in predictions:
+        attention_gallery = predictions["attention_viz_paths"]
+    if extract_attention and "attention_heatmap_path" in predictions:
+        attention_heatmap = predictions["attention_heatmap_path"]
 
-    return glbfile, log_msg, gr.Dropdown(choices=frame_filter_choices, value=frame_filter, interactive=True)
+    return glbfile, log_msg, gr.Dropdown(choices=frame_filter_choices, value=frame_filter, interactive=True), attention_gallery, attention_heatmap
 
 
 # -------------------------------------------------------------------------
@@ -316,6 +367,11 @@ def clear_fields():
     Clears the 3D viewer, the stored target_dir, and empties the gallery.
     """
     return None
+
+
+def toggle_attention_visibility(extract_attention):
+    """Toggle visibility of attention visualization components"""
+    return gr.update(visible=extract_attention), gr.update(visible=extract_attention)
 
 
 def update_log():
@@ -424,6 +480,7 @@ def get_examples_from_folder(images_folder):
         True,                        
         False,                       
         "Depthmap and Camera Branch",
+        False,                       
         "True"                       
     ]
     
@@ -567,6 +624,11 @@ with gr.Blocks(
                     scale=1,
                     elem_id="my_radio",
                 )
+                extract_attention = gr.Checkbox(
+                    label="Extract Global Attention Maps", 
+                    value=False,
+                    info="Extract and visualize global attention maps (may slow down inference)"
+                )
 
             with gr.Row():
                 conf_thres = gr.Slider(minimum=0, maximum=100, value=50, step=0.1, label="Confidence Threshold (%)")
@@ -576,6 +638,26 @@ with gr.Blocks(
                     mask_sky = gr.Checkbox(label="Filter Sky", value=False)
                     mask_black_bg = gr.Checkbox(label="Filter Black Background", value=False)
                     mask_white_bg = gr.Checkbox(label="Filter White Background", value=False)
+
+    # ---------------------- Attention Visualization Section ----------------------
+    with gr.Row():
+        with gr.Column():
+            gr.Markdown("**Global Attention Visualization**")
+            attention_gallery = gr.Gallery(
+                label="Attention Maps per Frame",
+                columns=2,
+                height="400px",
+                show_download_button=True,
+                object_fit="contain",
+                preview=True,
+                visible=False  # Initially hidden
+            )
+        with gr.Column():
+            attention_heatmap = gr.Image(
+                label="Attention Heatmap Summary",
+                height=400,
+                visible=False  # Initially hidden
+            )
 
     # ---------------------- Examples section ----------------------
     examples = get_examples_from_folder(building_folder)
@@ -590,6 +672,7 @@ with gr.Blocks(
         show_cam,
         mask_sky,
         prediction_mode,
+        extract_attention,
         is_example_str,
     ):
         """
@@ -601,10 +684,10 @@ with gr.Blocks(
         target_dir, image_paths = handle_uploads(input_video, input_images)
         # Always use "All" for frame_filter in examples
         frame_filter = "All"
-        glbfile, log_msg, dropdown = gradio_demo(
-            target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode
+        glbfile, log_msg, dropdown, attn_gallery, attn_heatmap = gradio_demo(
+            target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode, extract_attention
         )
-        return glbfile, log_msg, target_dir, dropdown, image_paths
+        return glbfile, log_msg, target_dir, dropdown, image_paths, attn_gallery, attn_heatmap
 
     gr.Markdown("Click any row to load an example.", elem_classes=["example-log"])
 
@@ -620,9 +703,10 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
+            extract_attention,
             is_example,
         ],
-        outputs=[reconstruction_output, log_output, target_dir_output, frame_filter, image_gallery],
+        outputs=[reconstruction_output, log_output, target_dir_output, frame_filter, image_gallery, attention_gallery, attention_heatmap],
         fn=example_pipeline,
         cache_examples=False,
         examples_per_page=50,
@@ -648,10 +732,20 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
+            extract_attention,
         ],
-        outputs=[reconstruction_output, log_output, frame_filter],
+        outputs=[reconstruction_output, log_output, frame_filter, attention_gallery, attention_heatmap],
     ).then(
         fn=lambda: "False", inputs=[], outputs=[is_example]  # set is_example to "False"
+    )
+
+    # -------------------------------------------------------------------------
+    # Attention visualization toggle
+    # -------------------------------------------------------------------------
+    extract_attention.change(
+        fn=toggle_attention_visibility,
+        inputs=[extract_attention],
+        outputs=[attention_gallery, attention_heatmap]
     )
 
     # -------------------------------------------------------------------------

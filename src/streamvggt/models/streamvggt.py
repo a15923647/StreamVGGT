@@ -1,6 +1,11 @@
 import torch
 import torch.nn as nn
-from huggingface_hub import PyTorchModelHubMixin  # used for model hub
+try:
+    from huggingface_hub import PyTorchModelHubMixin  # used for model hub
+    HF_AVAILABLE = True
+except ImportError:
+    PyTorchModelHubMixin = object  # Fallback
+    HF_AVAILABLE = False
 
 from streamvggt.models.aggregator import Aggregator
 from streamvggt.heads.camera_head import CameraHead
@@ -14,6 +19,8 @@ from dataclasses import dataclass
 class StreamVGGTOutput(ModelOutput):
     ress: Optional[List[dict]] = None
     views: Optional[torch.Tensor] = None
+    attention_maps: Optional[List[torch.Tensor]] = None
+    patch_start_idx: Optional[int] = None
 
 class StreamVGGT(nn.Module, PyTorchModelHubMixin):
     def __init__(self, img_size=518, patch_size=14, embed_dim=1024):
@@ -34,7 +41,8 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         history_info: Optional[dict] = None,
         past_key_values=None,
         use_cache=False,
-        past_frame_idx=0
+        past_frame_idx=0,
+        extract_attention=False
     ):
         images = torch.stack(
             [view["img"] for view in views], dim=0
@@ -49,7 +57,11 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         if history_info is None:
             history_info = {"token": None}
 
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+        if extract_attention:
+            aggregated_tokens_list, patch_start_idx, attention_maps = self.aggregator(images, extract_attention=True)
+        else:
+            aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+            attention_maps = None
         predictions = {}
 
         with torch.cuda.amp.autocast(enabled=False):
@@ -100,7 +112,12 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     if 'track' in predictions else {})
                 }
                 ress.append(res)
-            return StreamVGGTOutput(ress=ress, views=views)  # [S] [B, C, H, W]
+            
+            result = StreamVGGTOutput(ress=ress, views=views)  # [S] [B, C, H, W]
+            if extract_attention:
+                result.attention_maps = attention_maps
+                result.patch_start_idx = patch_start_idx
+            return result
         
     def inference(self, frames, query_points: torch.Tensor = None, past_key_values=None):        
         past_key_values = [None] * self.aggregator.depth
