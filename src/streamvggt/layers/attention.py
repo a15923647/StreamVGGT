@@ -8,7 +8,7 @@ from torch import nn
 import torch.nn.functional as F
 from typing import Union, Tuple, Dict, Optional
 
-from einops import rearrange
+# from einops import rearrange  # Not used
 
 XFORMERS_AVAILABLE = False
 

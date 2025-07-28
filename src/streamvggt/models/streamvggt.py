@@ -1,6 +1,11 @@
 import torch
 import torch.nn as nn
-from huggingface_hub import PyTorchModelHubMixin  # used for model hub
+try:
+    from huggingface_hub import PyTorchModelHubMixin  # used for model hub
+    HF_AVAILABLE = True
+except ImportError:
+    PyTorchModelHubMixin = object  # Fallback
+    HF_AVAILABLE = False
 
 from streamvggt.models.aggregator import Aggregator
 from streamvggt.heads.camera_head import CameraHead

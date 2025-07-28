@@ -4,10 +4,10 @@ Attention visualization utilities for StreamVGGT
 
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from typing import List, Tuple, Optional
 import os
+from typing import List, Tuple, Optional
+
+# Don't import matplotlib globally - import it when needed
 
 def process_attention_maps(attention_maps: List[torch.Tensor], 
                           patch_start_idx: int,
@@ -90,17 +90,36 @@ def create_attention_overlay(image: np.ndarray,
     attn_norm = (attention_map - attention_map.min()) / (attention_map.max() - attention_map.min() + 1e-8)
     
     # Resize attention map to match image size
-    from scipy.ndimage import zoom
-    H, W = image.shape[:2]
-    H_attn, W_attn = attn_norm.shape
-    
-    zoom_factors = (H / H_attn, W / W_attn)
-    attn_resized = zoom(attn_norm, zoom_factors, order=1)
+    try:
+        from scipy.ndimage import zoom
+        H, W = image.shape[:2]
+        H_attn, W_attn = attn_norm.shape
+        
+        zoom_factors = (H / H_attn, W / W_attn)
+        attn_resized = zoom(attn_norm, zoom_factors, order=1)
+    except ImportError:
+        # Fallback: simple upsampling without scipy
+        H, W = image.shape[:2]
+        H_attn, W_attn = attn_norm.shape
+        
+        # Simple nearest neighbor upsampling
+        attn_resized = np.zeros((H, W))
+        for i in range(H):
+            for j in range(W):
+                src_i = min(int(i * H_attn / H), H_attn - 1)
+                src_j = min(int(j * W_attn / W), W_attn - 1)
+                attn_resized[i, j] = attn_norm[src_i, src_j]
     
     # Apply colormap
-    cmap = plt.get_cmap(colormap)
-    attn_colored = cmap(attn_resized)[:, :, :3]  # Remove alpha channel
-    attn_colored = (attn_colored * 255).astype(np.uint8)
+    try:
+        import matplotlib.pyplot as plt
+        cmap = plt.get_cmap(colormap)
+        attn_colored = cmap(attn_resized)[:, :, :3]  # Remove alpha channel
+        attn_colored = (attn_colored * 255).astype(np.uint8)
+    except ImportError:
+        # Fallback: simple red overlay
+        attn_colored = np.zeros_like(image)
+        attn_colored[:, :, 0] = (attn_resized * 255).astype(np.uint8)
     
     # Blend with original image
     if image.max() <= 1.0:
@@ -126,6 +145,12 @@ def visualize_attention_maps(images: List[np.ndarray],
     Returns:
         List of saved file paths
     """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("Warning: matplotlib not available, skipping visualization")
+        return []
+        
     os.makedirs(save_dir, exist_ok=True)
     saved_paths = []
     
@@ -145,7 +170,10 @@ def visualize_attention_maps(images: List[np.ndarray],
         im1 = axes[1].imshow(attention_maps[i], cmap='jet')
         axes[1].set_title(f'Global Attention Map {i+1}')
         axes[1].axis('off')
-        plt.colorbar(im1, ax=axes[1])
+        try:
+            plt.colorbar(im1, ax=axes[1])
+        except:
+            pass
         
         # Overlay
         overlay = create_attention_overlay(images[i], attention_maps[i])
@@ -157,42 +185,50 @@ def visualize_attention_maps(images: List[np.ndarray],
         
         # Save plot
         save_path = os.path.join(save_dir, f"{prefix}_frame_{i+1}.png")
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        try:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            saved_paths.append(save_path)
+        except Exception as e:
+            print(f"Warning: Failed to save {save_path}: {e}")
         plt.close()
-        
-        saved_paths.append(save_path)
     
     # Create summary plot with all attention maps
     if len(attention_maps) > 1:
-        n_cols = min(4, len(attention_maps))
-        n_rows = (len(attention_maps) + n_cols - 1) // n_cols
-        
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4*n_cols, 4*n_rows))
-        if n_rows == 1:
-            axes = axes.reshape(1, -1)
-        
-        for i, attn_map in enumerate(attention_maps):
-            row = i // n_cols
-            col = i % n_cols
+        try:
+            n_cols = min(4, len(attention_maps))
+            n_rows = (len(attention_maps) + n_cols - 1) // n_cols
             
-            im = axes[row, col].imshow(attn_map, cmap='jet')
-            axes[row, col].set_title(f'Frame {i+1}')
-            axes[row, col].axis('off')
-            plt.colorbar(im, ax=axes[row, col])
-        
-        # Hide unused subplots
-        for i in range(len(attention_maps), n_rows * n_cols):
-            row = i // n_cols
-            col = i % n_cols
-            axes[row, col].axis('off')
-        
-        plt.tight_layout()
-        
-        summary_path = os.path.join(save_dir, f"{prefix}_summary.png")
-        plt.savefig(summary_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        saved_paths.append(summary_path)
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(4*n_cols, 4*n_rows))
+            if n_rows == 1:
+                axes = axes.reshape(1, -1)
+            
+            for i, attn_map in enumerate(attention_maps):
+                row = i // n_cols
+                col = i % n_cols
+                
+                im = axes[row, col].imshow(attn_map, cmap='jet')
+                axes[row, col].set_title(f'Frame {i+1}')
+                axes[row, col].axis('off')
+                try:
+                    plt.colorbar(im, ax=axes[row, col])
+                except:
+                    pass
+            
+            # Hide unused subplots
+            for i in range(len(attention_maps), n_rows * n_cols):
+                row = i // n_cols
+                col = i % n_cols
+                axes[row, col].axis('off')
+            
+            plt.tight_layout()
+            
+            summary_path = os.path.join(save_dir, f"{prefix}_summary.png")
+            plt.savefig(summary_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            
+            saved_paths.append(summary_path)
+        except Exception as e:
+            print(f"Warning: Failed to create summary plot: {e}")
     
     return saved_paths
 
@@ -213,6 +249,12 @@ def create_attention_heatmap(attention_maps: List[np.ndarray],
     """
     if not attention_maps:
         return None
+    
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("Warning: matplotlib not available, skipping heatmap creation")
+        return None
         
     # Stack attention maps for visualization
     if len(attention_maps) == 1:
@@ -220,7 +262,10 @@ def create_attention_heatmap(attention_maps: List[np.ndarray],
         fig, ax = plt.subplots(1, 1, figsize=(8, 6))
         im = ax.imshow(combined_attn, cmap='jet', aspect='auto')
         ax.set_title(title)
-        plt.colorbar(im, ax=ax)
+        try:
+            plt.colorbar(im, ax=ax)
+        except:
+            pass
         ax.axis('off')
     else:
         # Create temporal-spatial heatmap
@@ -247,11 +292,18 @@ def create_attention_heatmap(attention_maps: List[np.ndarray],
         ax.set_title(title)
         ax.set_xlabel('Frame Index')
         ax.set_ylabel('Spatial Location (flattened)')
-        plt.colorbar(im, ax=ax)
+        try:
+            plt.colorbar(im, ax=ax)
+        except:
+            pass
     
     plt.tight_layout()
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    return save_path
+    try:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        return save_path
+    except Exception as e:
+        print(f"Warning: Failed to save heatmap: {e}")
+        plt.close()
+        return None
