@@ -69,12 +69,21 @@ class Block(nn.Module):
 
         self.sample_drop_ratio = drop_path
 
-    def forward(self, x: Tensor, pos=None, attn_mask=None, past_key_values=None, use_cache=False) -> Union[Tensor, Tuple[Tensor, Dict]]:
+    def forward(self, x: Tensor, pos=None, attn_mask=None, past_key_values=None, use_cache=False, return_attention=False) -> Union[Tensor, Tuple[Tensor, Dict], Tuple[Tensor, Tensor]]:
             
-        def attn_residual_func(x: Tensor, pos=None, attn_mask=None, past_key_values=None, use_cache=False) -> Union[Tensor, Tuple[Tensor, Dict]]:
-            if use_cache:
+        def attn_residual_func(x: Tensor, pos=None, attn_mask=None, past_key_values=None, use_cache=False, return_attention=False) -> Union[Tensor, Tuple[Tensor, Dict], Tuple[Tensor, Tensor]]:
+            if use_cache and return_attention:
+                output, new_kv, attn_weights = self.attn(self.norm1(x), pos=pos, past_key_values=past_key_values, use_cache=True, return_attention=True)
+                return self.ls1(output), new_kv, attn_weights
+            elif use_cache:
                 output, new_kv = self.attn(self.norm1(x), pos=pos, past_key_values=past_key_values, use_cache=True)
                 return self.ls1(output), new_kv
+            elif return_attention:
+                if attn_mask is not None:
+                    output, attn_weights = self.attn(self.norm1(x), pos=pos, attn_mask=attn_mask, return_attention=True)
+                else:
+                    output, attn_weights = self.attn(self.norm1(x), pos=pos, return_attention=True)
+                return self.ls1(output), attn_weights
             else:
                 if attn_mask is not None:
                     return self.ls1(self.attn(self.norm1(x), pos=pos, attn_mask=attn_mask))
@@ -83,11 +92,21 @@ class Block(nn.Module):
         def ffn_residual_func(x: Tensor) -> Tensor:
             return self.ls2(self.mlp(self.norm2(x)))
         
-        if use_cache:
+        if use_cache and return_attention:
+            attn_output, new_kv, attn_weights = attn_residual_func(x, pos=pos, past_key_values=past_key_values, use_cache=True, return_attention=True)
+            x = x + attn_output
+            x = x + ffn_residual_func(x)
+            return x, new_kv, attn_weights
+        elif use_cache:
             attn_output, new_kv = attn_residual_func(x, pos=pos, past_key_values=past_key_values, use_cache=True)
             x = x + attn_output
             x = x + ffn_residual_func(x)
             return x, new_kv
+        elif return_attention:
+            attn_output, attn_weights = attn_residual_func(x, pos=pos, attn_mask=attn_mask, return_attention=True)
+            x = x + attn_output
+            x = x + ffn_residual_func(x)
+            return x, attn_weights
 
         if self.training and self.sample_drop_ratio > 0.1:
             # the overhead is compensated only for a drop path rate larger than 0.1

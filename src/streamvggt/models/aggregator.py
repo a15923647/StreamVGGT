@@ -190,17 +190,20 @@ class Aggregator(nn.Module):
         images: torch.Tensor,
         past_key_values=None,
         use_cache=False,
-        past_frame_idx=0
+        past_frame_idx=0,
+        extract_attention=False
     ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
                 B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+            extract_attention (bool): Whether to extract global attention maps
 
         Returns:
             (list[torch.Tensor], int):
                 The list of outputs from the attention blocks,
                 and the patch_start_idx indicating where patch tokens begin.
+                If extract_attention=True, also returns attention maps.
         """
         B, S, C_in, H, W = images.shape
 
@@ -257,6 +260,7 @@ class Aggregator(nn.Module):
         frame_idx = 0
         global_idx = 0
         output_list = []
+        global_attention_maps = [] if extract_attention else None
 
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
@@ -272,13 +276,22 @@ class Aggregator(nn.Module):
                             tokens, B, S, P, C, global_idx, pos=pos,
                             past_key_values_block=past_key_values[global_idx] if past_key_values[global_idx] is not None else None,
                             use_cache=True,
-                            past_frame_idx=past_frame_idx
+                            past_frame_idx=past_frame_idx,
+                            extract_attention=extract_attention
                         )
                         past_key_values[global_idx - 1] = new_kv
+                        if extract_attention and len(global_intermediates) > 1:  # Check if attention maps were returned
+                            global_attention_maps.extend(global_intermediates[1])  # Extract attention maps
+                            global_intermediates = global_intermediates[0]  # Get the regular intermediates
                     else: 
-                        tokens, global_idx, global_intermediates = self._process_global_attention(
-                            tokens, B, S, P, C, global_idx, pos=pos
+                        result = self._process_global_attention(
+                            tokens, B, S, P, C, global_idx, pos=pos, extract_attention=extract_attention
                         )
+                        if extract_attention:
+                            tokens, global_idx, global_intermediates, attention_maps = result
+                            global_attention_maps.extend(attention_maps)
+                        else:
+                            tokens, global_idx, global_intermediates = result
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
             for i in range(len(frame_intermediates)):
@@ -289,9 +302,14 @@ class Aggregator(nn.Module):
         del concat_inter
         del frame_intermediates
         del global_intermediates
-        if use_cache:      
-            return output_list, self.patch_start_idx, past_key_values
-        return output_list, self.patch_start_idx
+        if extract_attention:
+            if use_cache:      
+                return output_list, self.patch_start_idx, past_key_values, global_attention_maps
+            return output_list, self.patch_start_idx, global_attention_maps
+        else:
+            if use_cache:      
+                return output_list, self.patch_start_idx, past_key_values
+            return output_list, self.patch_start_idx
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
         """
@@ -325,11 +343,12 @@ class Aggregator(nn.Module):
         pos=None,
         past_key_values_block=None,
         use_cache=False,
-        past_frame_idx=0
-    ) -> Union[Tuple[torch.Tensor, int, List[torch.Tensor]], Tuple[torch.Tensor, int, List[torch.Tensor], List]]:
+        past_frame_idx=0,
+        extract_attention=False
+    ) -> Union[Tuple[torch.Tensor, int, List[torch.Tensor]], Tuple[torch.Tensor, int, List[torch.Tensor], List], Tuple[torch.Tensor, int, List[torch.Tensor], List[torch.Tensor]]]:
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
-                """
+        """
         
         if tokens.shape != (B, S * P, C):
             tokens = tokens.reshape(B, S, P, C).reshape(B, S * P, C)
@@ -338,6 +357,7 @@ class Aggregator(nn.Module):
             pos = pos.reshape(B, S, P, 2).reshape(B, S * P, 2)
             
         intermediates = []
+        attention_maps = [] if extract_attention else None
 
         for _ in range(self.aa_block_size):
             if not use_cache:
@@ -349,23 +369,45 @@ class Aggregator(nn.Module):
                 attn_mask = None
                 
             if use_cache:
-                tokens, block_kv = self.global_blocks[global_idx](
-                    tokens, 
-                    pos=pos, 
-                    attn_mask=attn_mask, 
-                    past_key_values=past_key_values_block,
-                    use_cache=True
-                )
+                if extract_attention:
+                    tokens, block_kv, attn_weights = self.global_blocks[global_idx](
+                        tokens, 
+                        pos=pos, 
+                        attn_mask=attn_mask, 
+                        past_key_values=past_key_values_block,
+                        use_cache=True,
+                        return_attention=True
+                    )
+                    attention_maps.append(attn_weights)
+                else:
+                    tokens, block_kv = self.global_blocks[global_idx](
+                        tokens, 
+                        pos=pos, 
+                        attn_mask=attn_mask, 
+                        past_key_values=past_key_values_block,
+                        use_cache=True
+                    )
             else:
-                tokens = self.global_blocks[global_idx](tokens, pos=pos, attn_mask=attn_mask)
+                if extract_attention:
+                    tokens, attn_weights = self.global_blocks[global_idx](
+                        tokens, pos=pos, attn_mask=attn_mask, return_attention=True
+                    )
+                    attention_maps.append(attn_weights)
+                else:
+                    tokens = self.global_blocks[global_idx](tokens, pos=pos, attn_mask=attn_mask)
             global_idx += 1
             intermediates.append(tokens.reshape(B, S, P, C))
 
             # if self.use_causal_global:
             #     del attn_mask
-        if use_cache:
-            return tokens, global_idx, intermediates, block_kv
-        return tokens, global_idx, intermediates
+        if extract_attention:
+            if use_cache:
+                return tokens, global_idx, [intermediates, attention_maps], block_kv
+            return tokens, global_idx, intermediates, attention_maps
+        else:
+            if use_cache:
+                return tokens, global_idx, intermediates, block_kv
+            return tokens, global_idx, intermediates
 
 
 def slice_expand_and_flatten(token_tensor, B, S):

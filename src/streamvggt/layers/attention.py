@@ -47,8 +47,9 @@ class Attention(nn.Module):
         pos=None, 
         attn_mask=None, 
         past_key_values=None, 
-        use_cache=False
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Tuple]]:
+        use_cache=False,
+        return_attention=False
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Tuple], Tuple[torch.Tensor, torch.Tensor]]:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
@@ -77,7 +78,8 @@ class Attention(nn.Module):
             q = self.rope(q, pos)
             k = self.rope(k, pos_k)
 
-        if self.fused_attn:
+        attn_weights = None
+        if self.fused_attn and not return_attention:
             x = F.scaled_dot_product_attention(
                 q,
                 k,
@@ -96,14 +98,21 @@ class Attention(nn.Module):
                 attn = attn + attn_mask
 
             attn = attn.softmax(dim=-1)
+            if return_attention:
+                attn_weights = attn.clone()  # Store attention weights before dropout
             attn = self.attn_drop(attn)
             x = attn @ v
 
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-        if use_cache:
+        
+        if use_cache and return_attention:
+            return x, new_kv, attn_weights
+        elif use_cache:
             return x, new_kv
+        elif return_attention:
+            return x, attn_weights
         return x
 
 
