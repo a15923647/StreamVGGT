@@ -1,0 +1,1 @@
+# StreamVGGT config package

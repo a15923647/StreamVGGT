@@ -26,12 +26,16 @@ from streamvggt.utils.geometry import unproject_depth_map_to_point_map
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-print("Initializing and loading StreamVGGT model...")
+print("Initializing and loading StreamVGGT model with KV cache optimization...")
 
 local_ckpt_path = "ckpt/checkpoints.pth"
 if os.path.exists(local_ckpt_path):
     print(f"Loading local checkpoint from {local_ckpt_path}")
-    model = StreamVGGT()
+    model = StreamVGGT(
+        max_cached_frames=5,
+        enable_kv_cache_optimization=True,
+        similarity_method="cosine"
+    )
     ckpt = torch.load(local_ckpt_path, map_location="cpu")
     model.load_state_dict(ckpt, strict=True)
     model.eval()
@@ -45,11 +49,17 @@ else:
         revision="main",
         force_download=True
     )
-    model = StreamVGGT()
+    model = StreamVGGT(
+        max_cached_frames=5,
+        enable_kv_cache_optimization=True,
+        similarity_method="cosine"
+    )
     ckpt = torch.load(path, map_location="cpu")
     model.load_state_dict(ckpt, strict=True)
     model.eval() 
     del ckpt
+
+print(f"Model initialized with KV cache optimization (max_cached_frames={model.max_cached_frames})")
 
 
 
