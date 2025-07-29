@@ -6,6 +6,7 @@ from streamvggt.models.aggregator import Aggregator
 from streamvggt.heads.camera_head import CameraHead
 from streamvggt.heads.dpt_head import DPTHead
 from streamvggt.heads.track_head import TrackHead
+from streamvggt.utils.kv_cache_manager import KVCacheManager
 from transformers.file_utils import ModelOutput
 from typing import Optional, Tuple, List, Any
 from dataclasses import dataclass
@@ -16,7 +17,8 @@ class StreamVGGTOutput(ModelOutput):
     views: Optional[torch.Tensor] = None
 
 class StreamVGGT(nn.Module, PyTorchModelHubMixin):
-    def __init__(self, img_size=518, patch_size=14, embed_dim=1024):
+    def __init__(self, img_size=518, patch_size=14, embed_dim=1024, 
+                 max_cached_frames=5, similarity_method="cosine", enable_kv_cache_optimization=True):
         super().__init__()
 
         self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
@@ -24,6 +26,17 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1")
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1")
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size)
+        
+        # KV cache optimization
+        self.enable_kv_cache_optimization = enable_kv_cache_optimization
+        self.max_cached_frames = max_cached_frames
+        self.similarity_method = similarity_method
+        
+        if self.enable_kv_cache_optimization:
+            self.kv_cache_manager = KVCacheManager(
+                max_cached_frames=max_cached_frames,
+                similarity_method=similarity_method
+            )
     
 
 
@@ -109,13 +122,59 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         all_ress = []
         processed_frames = []
 
+        # Reset KV cache manager for new sequence
+        if self.enable_kv_cache_optimization:
+            self.kv_cache_manager.reset()
+
         for i, frame in enumerate(frames):
             images = frame["img"].unsqueeze(0) 
+            
+            # Get initial aggregator output to extract pointmap
+            initial_aggregator_output = self.aggregator(
+                images, 
+                past_key_values=[None] * self.aggregator.depth,  # Temporary pass without cache
+                use_cache=False, 
+                past_frame_idx=i
+            )
+            
+            if isinstance(initial_aggregator_output, tuple) and len(initial_aggregator_output) >= 2:
+                initial_aggregated_tokens, patch_start_idx = initial_aggregator_output[:2]
+            else:
+                initial_aggregated_tokens, patch_start_idx = initial_aggregator_output
+            
+            # Get pointmap and confidence for KV cache optimization
+            current_pointmap = None
+            current_conf = None
+            
+            if self.enable_kv_cache_optimization and self.point_head is not None:
+                with torch.cuda.amp.autocast(enabled=False):
+                    pts3d, pts3d_conf = self.point_head(
+                        initial_aggregated_tokens, images=images, patch_start_idx=patch_start_idx
+                    )
+                    current_pointmap = pts3d[:, 0]  # Remove sequence dimension
+                    current_conf = pts3d_conf[:, 0]
+            
+            # Update KV cache based on pointmap similarity
+            should_update_cache = False
+            frames_to_keep = list(range(i + 1))  # Default: keep all frames
+            
+            if self.enable_kv_cache_optimization and current_pointmap is not None:
+                should_update_cache, frames_to_keep = self.kv_cache_manager.should_update_cache(
+                    i, current_pointmap, current_conf
+                )
+                
+                # Filter past KV cache if needed
+                if should_update_cache and i > 0:
+                    past_key_values = self.kv_cache_manager.filter_kv_cache(
+                        past_key_values, frames_to_keep, i
+                    )
+            
+            # Run aggregator with (potentially filtered) cache
             aggregator_output = self.aggregator(
                 images, 
                 past_key_values=past_key_values,
                 use_cache=True, 
-                past_frame_idx=i
+                past_frame_idx=len(frames_to_keep) - 1 if self.enable_kv_cache_optimization else i
             )
             
             if isinstance(aggregator_output, tuple) and len(aggregator_output) == 3:
@@ -137,9 +196,14 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     depth_conf = depth_conf[:, 0]
                 
                 if self.point_head is not None:
-                    pts3d, pts3d_conf = self.point_head(
-                        aggregated_tokens, images=images, patch_start_idx=patch_start_idx
-                    )
+                    if self.enable_kv_cache_optimization and current_pointmap is not None:
+                        # Reuse already computed pointmap to avoid redundant computation
+                        pts3d = current_pointmap.unsqueeze(1)  # Add back sequence dimension
+                        pts3d_conf = current_conf.unsqueeze(1)
+                    else:
+                        pts3d, pts3d_conf = self.point_head(
+                            aggregated_tokens, images=images, patch_start_idx=patch_start_idx
+                        )
                     pts3d = pts3d[:, 0] 
                     pts3d_conf = pts3d_conf[:, 0]
 
